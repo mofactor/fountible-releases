@@ -1,0 +1,1 @@
+Fountible macOS desktop — public downloads + auto-update feed. App source is private.
