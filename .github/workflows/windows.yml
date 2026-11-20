@@ -1,0 +1,125 @@
+# Windows edition of each Fountible release.
+#
+# THIS FILE BELONGS IN THE PUBLIC REPO mofactor/fountible-releases, as
+# .github/workflows/windows.yml. It lives in the private repo next to the
+# scripts it runs (apps/desktop/windows/) so the two change together; see
+# README.md there for the whole release path.
+#
+# A stable Mac release published to this repo carries a Windows kit
+# (Fountible-<version>-windows-kit.zip). This job turns that release's Mac app
+# into the Windows installer, checks it on a real Windows machine (install,
+# open, update once, uninstall) and only then attaches it, with latest.yml last.
+# Installed Windows apps update from latest.yml, so a failed run leaves them on
+# the version they have.
+#
+# Cost: none. Standard GitHub machines are free in a public repo, and the job
+# uses no secrets, only its own token to add files to this repo's releases.
+# Everything it prints and keeps is public, like this repo.
+
+name: Windows edition
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The release to give a Windows edition (for example v0.0.512)
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  windows:
+    # Betas (prereleases) get no Windows edition. A run by hand always builds.
+    if: ${{ github.event_name == 'workflow_dispatch' || !github.event.release.prerelease }}
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write # attach the installer to the release
+    concurrency:
+      group: windows-${{ github.event.release.tag_name || inputs.tag }}
+      cancel-in-progress: false
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Fetch the Mac release and its Windows kit
+        id: fetch
+        run: |
+          set -euo pipefail
+          V="${TAG#v}"
+          if ! [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::$TAG is not a release tag like v0.0.512"
+            exit 1
+          fi
+          IFS=. read -r MA MI PA <<< "$V"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "next=$MA.$MI.$((PA + 1))" >> "$GITHUB_OUTPUT"
+          mkdir -p in
+          if ! gh release download "$TAG" --dir in --pattern "Fountible-$V-windows-kit.zip"; then
+            echo "::notice::$TAG has no Windows kit (it predates the Windows edition); nothing to build"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          gh release download "$TAG" --dir in --pattern "Fountible-$V-arm64-mac.zip"
+          ls -la in
+
+      - name: Unpack the kit
+        if: steps.fetch.outputs.skip != 'true'
+        shell: pwsh
+        run: Expand-Archive -Path "in/Fountible-${{ steps.fetch.outputs.version }}-windows-kit.zip" -DestinationPath .
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: steps.fetch.outputs.skip != 'true'
+        with:
+          node-version: 24.11.1
+
+      # The kit's own locked tools. No install scripts: nothing in the list
+      # needs one, and the one that has one (a Squirrel installer helper) is
+      # never used.
+      - name: Install the kit's tools
+        if: steps.fetch.outputs.skip != 'true'
+        working-directory: kit
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Build the Windows installer
+        if: steps.fetch.outputs.skip != 'true'
+        run: node kit/repackage.mjs --from "in/Fountible-${{ steps.fetch.outputs.version }}-arm64-mac.zip" --out out
+
+      # The same app one version higher, served only to the check below as a
+      # local update feed. Never published. Stored uncompressed: it is only
+      # read from this machine's disk.
+      - name: Build a newer copy for the update check
+        if: steps.fetch.outputs.skip != 'true'
+        run: node kit/repackage.mjs --from "in/Fountible-${{ steps.fetch.outputs.version }}-arm64-mac.zip" --out next --version "${{ steps.fetch.outputs.next }}" --compression store
+
+      - name: Check install, open, update and uninstall
+        if: steps.fetch.outputs.skip != 'true'
+        timeout-minutes: 25
+        run: node kit/check.mjs --installer "out/Fountible-Setup-${{ steps.fetch.outputs.version }}.exe" --next next --report report
+
+      - name: Keep the check's report and screenshot
+        if: always() && steps.fetch.outputs.skip != 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-check-${{ steps.fetch.outputs.version }}
+          path: report
+          retention-days: 14
+          if-no-files-found: warn
+
+      # latest.yml last: it is what installed apps update from, so the
+      # installer it names has to be there first.
+      - name: Publish the Windows edition
+        if: steps.fetch.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          V="${{ steps.fetch.outputs.version }}"
+          gh release upload "$TAG" --clobber "out/Fountible-Setup-$V.exe" "out/Fountible-Setup-$V.exe.blockmap"
+          gh release upload "$TAG" --clobber out/latest.yml
+          echo "Published the Windows edition of $TAG"
